@@ -113,7 +113,7 @@
         base-uri: base-uri,
         total-layers: u0,
         is-finalized: false,
-        created-at: block-height,
+        created-at: stacks-block-height,
         total-revenue: u0
       }
     )
@@ -132,7 +132,7 @@
     (
       (artwork (unwrap! (map-get? artworks { artwork-id: artwork-id }) err-not-found))
       (layer-id (var-get next-layer-id))
-      (voting-deadline (+ block-height voting-period))
+      (voting-deadline (+ stacks-block-height voting-period))
     )
     (asserts! (not (get is-finalized artwork)) err-artwork-finalized)
     (asserts! (is-none (map-get? layers { artwork-id: artwork-id, layer-id: layer-id })) err-layer-exists)
@@ -147,7 +147,7 @@
         votes-for: u0,
         votes-against: u0,
         voting-deadline: voting-deadline,
-        created-at: block-height,
+        created-at: stacks-block-height,
         contribution-weight: u0
       }
     )
@@ -164,11 +164,11 @@
       (existing-vote (map-get? layer-votes { artwork-id: artwork-id, layer-id: layer-id, voter: tx-sender }))
     )
     (asserts! (is-none existing-vote) err-already-voted)
-    (asserts! (< block-height (get voting-deadline layer)) err-voting-closed)
+    (asserts! (< stacks-block-height (get voting-deadline layer)) err-voting-closed)
     
     (map-set layer-votes
       { artwork-id: artwork-id, layer-id: layer-id, voter: tx-sender }
-      { vote: vote, voted-at: block-height }
+      { vote: vote, voted-at: stacks-block-height }
     )
     
     (if vote
@@ -194,7 +194,7 @@
       (total-votes (+ (get votes-for layer) (get votes-against layer)))
       (approval-percentage (if (> total-votes u0) (/ (* (get votes-for layer) u100) total-votes) u0))
     )
-    (asserts! (>= block-height (get voting-deadline layer)) err-voting-closed)
+    (asserts! (>= stacks-block-height (get voting-deadline layer)) err-voting-closed)
     (asserts! (>= total-votes min-votes-required) err-insufficient-votes)
     
     (if (>= approval-percentage approval-threshold)
@@ -258,7 +258,7 @@
         base-uri: (get base-uri parent-artwork),
         total-layers: fork-at-layer,
         is-finalized: false,
-        created-at: block-height,
+        created-at: stacks-block-height,
         total-revenue: u0
       }
     )
@@ -270,7 +270,7 @@
         creator: tx-sender,
         fork-artwork-id: new-artwork-id,
         forked-at-layer: fork-at-layer,
-        created-at: block-height
+        created-at: stacks-block-height
       }
     )
     
@@ -329,11 +329,127 @@
     ;; Update claim record
     (map-set revenue-claims
       { artwork-id: artwork-id, contributor: tx-sender }
-      { claimed-amount: contributor-share, last-claim-block: block-height }
+      { claimed-amount: contributor-share, last-claim-block: stacks-block-height }
     )
     
     ;; Transfer tokens (this would integrate with STX or other token transfer)
     ;; For now, we just record the claim
     (ok net-amount)
+  )
+)
+
+
+;; read only functions
+
+;; Get artwork details
+(define-read-only (get-artwork (artwork-id uint))
+  (map-get? artworks { artwork-id: artwork-id })
+)
+
+;; Get layer details
+(define-read-only (get-layer (artwork-id uint) (layer-id uint))
+  (map-get? layers { artwork-id: artwork-id, layer-id: layer-id })
+)
+
+;; Get contributor data
+(define-read-only (get-contributor (artwork-id uint) (contributor principal))
+  (map-get? artwork-contributors { artwork-id: artwork-id, contributor: contributor })
+)
+
+;; Get vote details
+(define-read-only (get-vote (artwork-id uint) (layer-id uint) (voter principal))
+  (map-get? layer-votes { artwork-id: artwork-id, layer-id: layer-id, voter: voter })
+)
+
+;; Get fork details
+(define-read-only (get-fork (parent-artwork-id uint) (fork-id uint))
+  (map-get? forks { parent-artwork-id: parent-artwork-id, fork-id: fork-id })
+)
+
+;; Get current artwork ID
+(define-read-only (get-next-artwork-id)
+  (var-get next-artwork-id)
+)
+
+;; Get current layer ID
+(define-read-only (get-next-layer-id)
+  (var-get next-layer-id)
+)
+
+;; Calculate claimable revenue for a contributor
+(define-read-only (get-claimable-revenue (artwork-id uint) (contributor principal))
+  (match (map-get? artwork-contributors { artwork-id: artwork-id, contributor: contributor })
+    contributor-data
+    (let
+      (
+        (artwork (unwrap-panic (map-get? artworks { artwork-id: artwork-id })))
+        (claim-data (default-to { claimed-amount: u0, last-claim-block: u0 } 
+                      (map-get? revenue-claims { artwork-id: artwork-id, contributor: contributor })))
+        (total-contribution-weight (calculate-total-contribution-weight artwork-id))
+        (contributor-share (if (> total-contribution-weight u0)
+                            (/ (* (get total-revenue artwork) (get total-contribution-weight contributor-data)) total-contribution-weight)
+                            u0))
+        (claimable-amount (- contributor-share (get claimed-amount claim-data)))
+      )
+      (ok claimable-amount)
+    )
+    (ok u0)
+  )
+)
+
+;; Get NFT URI (implementing trait requirement)
+(define-read-only (get-token-uri (token-id uint))
+  (match (map-get? artworks { artwork-id: token-id })
+    artwork-data (ok (some (get base-uri artwork-data)))
+    (ok none)
+  )
+)
+
+;; Get NFT owner (implementing trait requirement)
+(define-read-only (get-owner (token-id uint))
+  (ok (nft-get-owner? arthive-art token-id))
+)
+
+;; Get last token ID (implementing trait requirement)
+(define-read-only (get-last-token-id)
+  (ok (- (var-get next-artwork-id) u1))
+)
+
+;; private functions
+
+;; Calculate contribution weight for a layer based on various factors
+(define-private (calculate-contribution-weight (artwork-id uint) (layer-id uint))
+  (let
+    (
+      (layer (unwrap-panic (map-get? layers { artwork-id: artwork-id, layer-id: layer-id })))
+      (artwork (unwrap-panic (map-get? artworks { artwork-id: artwork-id })))
+      (total-votes (+ (get votes-for layer) (get votes-against layer)))
+      (approval-percentage (if (> total-votes u0) (/ (* (get votes-for layer) u100) total-votes) u0))
+      (base-weight u50)
+      (vote-bonus (if (> approval-percentage u80) u25 
+                   (if (> approval-percentage u60) u15 u0)))
+      (layer-position-bonus (if (< (get total-layers artwork) u5) u15 u5))
+    )
+    (+ base-weight vote-bonus layer-position-bonus)
+  )
+)
+
+;; Calculate total contribution weight for an artwork
+(define-private (calculate-total-contribution-weight (artwork-id uint))
+  ;; This is a simplified calculation - in practice, you'd iterate through all contributors
+  ;; For now, we'll use a base calculation
+  (let
+    (
+      (artwork (unwrap-panic (map-get? artworks { artwork-id: artwork-id })))
+    )
+    (* (+ (get total-layers artwork) u1) u50) ;; Simplified calculation
+  )
+)
+
+;; Transfer NFT (implementing trait requirement)
+(define-public (transfer (token-id uint) (sender principal) (recipient principal))
+  (begin
+    (asserts! (is-eq tx-sender sender) err-unauthorized)
+    (nft-transfer? arthive-art token-id sender recipient)
   )
 )
